@@ -1,4 +1,6 @@
 #!/usr/bin/Rscript
+options(stringsAsFactors=FALSE,width=200)
+
 library("data.table")
 library("bit64")
 library("xlsx")
@@ -7,9 +9,10 @@ library("stringr")
 library("seqinr")
 
 argv <- commandArgs(T)
-dir <- argv[1]
-project <- argv[2]
-date <- argv[3]
+dir <- argv[1] #eg /home/AD/tbleazar/165
+project <- argv[2] #eg 165
+date <- argv[3] #eg 180430
+#will look for an annotationfile of form paste0(dir,"/input/reference/",reference,".gff3")
 
 setwd(paste0(dir,"/analysis"))
 
@@ -39,7 +42,92 @@ baseCalls$pos <- as.numeric(baseCalls$pos)
 baseCalls$plotPos <- 1:nrow(baseCalls)   #### HACK
 baseCalls$chrEnd <- baseCalls$pos == 1
 baseCalls$chrEnd[1] <- F
-print(baseCalls)
+#print(baseCalls)
+
+#
+#  HERE CREATING GENOME ANNOTATIONS IF THE APPROPRIATE ANNOTATION FILES EXIST
+#
+annotatetable = FALSE
+
+#initialise an empty data frame with our appropriate types
+allredgreen = data.frame(REFERENCE=character(), CHROMOSOME=character(), POSITION=integer(), REPEATREGION=logical(), GENEREGION=logical(), GENENAMES=character())
+
+for (reference in references) {
+  print("Starting looking for annotation for reference:")
+  annotationfile = paste0(dir,"/input/reference/",reference,".gff3")
+  print(annotationfile)
+  if (!file.exists(annotationfile)) {
+    print("Failed to find annotation, will not use for the report")
+    next
+  } else {
+    print("Found file, creating redgreen reference table")
+    annotatetable = TRUE
+    foundchromosome = FALSE
+  }
+  gfflines = readLines(con=annotationfile)
+  for (gffline in gfflines) {
+    if ((substr(gffline,1,1) == "#") || (nchar(gffline) < 2)) { #ignore comment or empty lines
+      next
+    }
+    collect = unlist(strsplit(gffline, split="\t"))
+    if ((collect[3] == "region") && (!foundchromosome)) {
+      print("Creating redgreen dataframe for this reference, of size:")
+      genomesize = strtoi(collect[5])
+      print(genomesize)
+      redgreen = data.frame(REFERENCE=rep(reference, genomesize), CHROMOSOME=rep(collect[1], genomesize), POSITION=1:genomesize, REPEATREGION=rep(FALSE, genomesize), GENEREGION=rep(FALSE, genomesize), GENENAMES=rep("", genomesize))
+      print(summary(redgreen))
+      print(head(redgreen))
+      foundchromosome = TRUE
+      print("Now going through the gff3 annotation lines slowly")
+    }
+    if (grepl("repeat", collect[3], fixed=TRUE)) {
+      #print("Found a repeat")
+      startpoint = strtoi(collect[4])
+      stoppoint = strtoi(collect[5])
+      if (stoppoint <= genomesize) {
+        redgreen$REPEATREGION[startpoint:stoppoint] = TRUE
+      } else {
+        print("Error, gff3 file records a repeat that goes outside the genome size")
+      }
+    }
+    if (grepl("gene", collect[3], fixed=TRUE)) {
+      #print("Found a gene")
+      startpoint = strtoi(collect[4])
+      stoppoint = strtoi(collect[5])
+      if (stoppoint <= genomesize) {
+        redgreen$GENEREGION[startpoint:stoppoint] = TRUE
+        genename = (unlist(strsplit((unlist(strsplit(collect[9], split="Name=")))[2], split=";")))[1]
+        for (i in startpoint:stoppoint) {
+          if (nchar(redgreen[i,'GENENAMES'])<1) {
+            redgreen[i,'GENENAMES'] = genename
+          } else {
+            redgreen[i,'GENENAMES'] = paste(redgreen[i,'GENENAMES'], genename, sep=",")
+          }
+        }
+      } else {
+        print("Error, gff3 file records a gene that goes outside the genome size")
+      }
+    }
+  }
+  allredgreen = rbind(allredgreen, redgreen)
+}
+redgreen = allredgreen
+#redgreen is of the form
+#      REFERENCE  CHROMOSOME POSITION REPEATREGION GENEREGION GENENAMES
+#1 HSV1-strain17 NC_001798.2        1         TRUE       TRUE       LAT
+#2 HSV1-strain17 NC_001798.2        2         TRUE       TRUE       LAT
+#3 HSV1-strain17 NC_001798.2        3         TRUE       TRUE       LAT
+ 
+#
+#  Now merge in the redgreen annotations to the baseCalls, if we have found the gff3 file
+#
+if (annotatetable) {
+  print("Now merging the redgreen annotations with the baseCalls")
+  baseCalls = merge(x=baseCalls, y=redgreen, by.x=c("reference","chr","pos"), by.y=c("REFERENCE","CHROMOSOME","POSITION"), all.x=TRUE)
+  print(head(baseCalls))
+}
+
+
 
 #
 #  SAMPLES
@@ -78,6 +166,13 @@ makeCalls <- function() {
   colnames(allCalls) <- cnames
   cols <- 6:26
   allCalls[,(cols):=lapply(.SD,as.numeric),.SDcols=cols]
+  #tom addition: also insert the columns from baseCalls table for repeat and gene region info if we have set logical annotatetable
+  if (annotatetable) {
+    print("Merging the allCalls table with additional annotations")
+    allCalls = merge(x=allCalls, y=baseCalls[,c("chr","pos","REPEATREGION","GENEREGION","GENENAMES")], by.x=c("chr","pos"), by.y=c("chr","pos"), all.x=TRUE)
+  }
+  print("Now writing to tsv files")
+  print(head(allCalls))
   write.table(allCalls,file=sprintf("%s.calls",project),row.names=F,quote=F,sep="\t")
   bA <- (allCalls$A   >= 100 & allCalls$pA >= 0.01)
   bC <- (allCalls$C   >= 100 & allCalls$pC >= 0.01)
@@ -195,13 +290,27 @@ makeFigures <- function() {
   smallBaseCalls <- baseCalls[,c("reference","chr","pos","plotPos","chrEnd")]
   for (r in references) {
     for (s in unique(samples$name)) {
+      #cat("On the first reference/sample combo\n")
       cat(r,s,"\n")
       coverage <- merge(smallBaseCalls,calls[reference==r & sample==s],by=c("reference","chr","pos"))
+      print("Just merged the coverage table with the calls:")
+      print(head(coverage))
+      if (nrow(m.nr) > 0) {
       nr       <- merge(smallBaseCalls, m.nr[reference==r & sample==s],by=c("reference","chr","pos"))
+      } else {
+      nr <- data.table(reference=character(0), chr=character(0), pos=integer(0)) #clause added by tom to handle empty m.nr
+      }      
       bi       <- merge(smallBaseCalls, m.bi[reference==r & sample==s],by=c("reference","chr","pos"))
-      lc <- coverage$plotPos[coverage$cov < 100]
+      print("Made bi merge")
+      print(head(bi))
       col <- rep("black",nrow(baseCalls))
+      lc <- coverage$plotPos[coverage$cov < 100]
       col[lc] <- "grey"
+      if (annotatetable) {
+        print("Using repeat region annotations in plot")
+        repeatregions = coverage$plotPos[coverage$REPEATREGION]
+        col[repeatregions] = "purple" #a long vector of colors for all the points along the coverage plot, with those in repeat regions set to purple
+      }
       png(sprintf("figures/coverage_%s_%s.png",r,s),width=1400,height=700)
       par(cex=2)
       plot(coverage$plotPos,log10(coverage$cov),col=col,pch=".",xlim=c(0,maxpos),ylim=c(0,log10(maxcov)),xlab=sprintf("%s (%dbp)",r,nrow(coverage)),ylab="log10 Coverage")
@@ -209,7 +318,11 @@ makeFigures <- function() {
       if (nrow(bi) > 0) { abline(v=bi$plotPos,col="green") }
       abline(h=2,col="grey")
       abline(v=smallBaseCalls$plotPos[smallBaseCalls$chrEnd],col="grey")
-      legend("bottomright",legend=c(sprintf("Consensus : %d",nrow(nr)),sprintf("SNPs : %d",nrow(bi)),sprintf("Low : %d",length(lc))),col=c("red","green","grey"),pch=19)
+      if (annotatetable) {
+        legend("bottomright",legend=c(sprintf("Non-reference : %d",nrow(nr)),sprintf("SNVs : %d",nrow(bi)),sprintf("Repeat region : %d",length(repeatregions)),sprintf("Low coverage : %d",length(lc))),col=c("red","green","purple","grey"),pch=19)
+      } else {
+        legend("bottomright",legend=c(sprintf("Non-reference : %d",nrow(nr)),sprintf("SNVs : %d",nrow(bi)),sprintf("Low coverage : %d",length(lc))),col=c("red","green","grey"),pch=19)
+      }
       dev.off()
     }
   }
@@ -244,11 +357,29 @@ makeReport <- function() {
   cat("\\begin{document}\n")
   for (r in references) {
     for (s in unique(samples$name)) {
-      m <- mutations[reference==r & sample==s,c("chr","pos","ref","cov","pA","pC","pG","pT")]
+        if (annotatetable) {
+          m <- mutations[reference==r & sample==s,c("chr","pos","ref","cov","pA","pC","pG","pT","REPEATREGION","GENEREGION","GENENAMES")]
+          m$genes = m$GENENAMES
+          m$repeats = rep("",nrow(m))
+          for (geneind in 1:nrow(m)) {
+            if (m$REPEATREGION[geneind]) {
+              m$repeats[geneind] = "repeat region"
+            }
+          }
+          m = m[,c("chr","pos","ref","cov","pA","pC","pG","pT","repeats","genes")]
+        } else {
+          m <- mutations[reference==r & sample==s,c("chr","pos","ref","cov","pA","pC","pG","pT")]
+        }
+      #sorting the mutations list by chromosome name
+      m <- m[order(m$chr),]
       cat("\\begin{center}\\Large \\verb|",r,"| : \\verb|",s,"|\\end{center}\n",sep="")
       cat("\\includegraphics[width=\\textwidth]{figures/coverage_",r,"_",s,"}\n",sep="")
       if (nrow(m) > 0) {
-        print(xtable(m[1:min(35,nrow(m))],align="|lrrrr|rrrr|"),tabular.environment="longtable",floating=F)
+        if (annotatetable) {
+          print(xtable(m[1:min(35,nrow(m))],align="|lrrrr|rrrr|cc|"),tabular.environment="longtable",floating=F)
+        } else {
+          print(xtable(m[1:min(35,nrow(m))],align="|lrrrr|rrrr|"),tabular.environment="longtable",floating=F)
+        }
         if (nrow(m) > 35) { cat("Only top 35 rows shown \\\\ \n") }
       } else {
         cat("No SNPs \\\\ \n")
